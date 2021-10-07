@@ -1,0 +1,13 @@
+[package]
+name = "shrtlnk"
+version = "0.1.0"
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+tide = "0.16.0"
+tokio = { version = "1.12.0", features = ["sync", "rt", "rt-multi-thread", "macros", "signal"] }
+serde = { version = "1.0.130", features = ["derive"] }
+toml = "0.5.8"
+anyhow = "1.0.44"
