@@ -1,7 +1,5 @@
 use std::sync::Arc;
 
-use tokio;
-
 mod app;
 
 #[tokio::main]
