@@ -4,7 +4,6 @@ use anyhow::{anyhow, Result};
 use serde::Deserialize;
 use tide::{Redirect, Request};
 use tokio::sync::RwLock;
-use toml;
 
 #[derive(Deserialize, Default)]
 pub struct LinkSettings {
@@ -42,7 +41,7 @@ impl Config {
     }
 
     pub fn changes_require_restart(&self, other: &Self) -> bool {
-        return (self.host != other.host) || (self.port != other.port);
+        (self.host != other.host) || (self.port != other.port)
     }
 }
 
@@ -54,7 +53,7 @@ pub struct Application {
 impl Application {
     pub async fn new(config_location: String) -> Result<Self> {
         let me = Self {
-            config_location: config_location,
+            config_location,
             config: RwLock::new(Config::default()),
         };
 
