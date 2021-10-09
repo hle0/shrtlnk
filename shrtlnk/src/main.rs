@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 mod app;
+mod config;
 
 #[tokio::main]
 async fn main() {

@@ -1,7 +1,30 @@
 host = "0.0.0.0"
-port = 8387
 
-[links]
+[errors]
 
-[links.google]
-dst = "https://www.google.com/"
+[errors.not_found]
+
+type = "string"
+data = "We couldn't find the file. Sorry! (404)"
+
+[pages]
+
+[pages.amd]
+
+type = "redirect"
+to = "https://amd.com"
+
+[pages.fail]
+
+type = "redirect"
+to = "/fd"
+
+[pages.text]
+
+type = "string"
+data = "this is a string."
+
+[pages.file]
+
+type = "file"
+path = "config.toml"
