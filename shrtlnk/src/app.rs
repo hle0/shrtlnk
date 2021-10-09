@@ -1,64 +1,34 @@
-use std::{collections::BTreeMap, fs::File, io::Read, sync::Arc};
+use std::{fs::File, io::Read, sync::Arc};
 
 use anyhow::{anyhow, Result};
-use serde::Deserialize;
-use tide::{Redirect, Request};
+use tide::Request;
 use tokio::sync::RwLock;
 
-#[derive(Deserialize, Default)]
-pub struct LinkSettings {
-    dst: String,
-}
-
-#[derive(Deserialize, Default)]
-pub struct Config {
-    host: String,
-    port: u16,
-    links: BTreeMap<String, LinkSettings>,
-}
-
-impl Config {
-    pub fn check(&self) -> Result<()> {
-        for x in self.links.keys() {
-            if !x.chars().all(|c| {
-                c.is_ascii_alphanumeric()
-                    || (c == '_')
-                    || (c == '-')
-                    || (c == '.')
-                    || (c == '$')
-                    || (c == '#')
-                    || (c == '~')
-                    || (c == '@')
-            }) {
-                return Err(anyhow!(
-                    "Configured shortlink '{:?}' contains invalid characters",
-                    x
-                ));
-            }
-        }
-
-        Ok(())
-    }
-
-    pub fn changes_require_restart(&self, other: &Self) -> bool {
-        (self.host != other.host) || (self.port != other.port)
-    }
-}
+use crate::config::{CheckConfig, Config};
 
 pub struct Application {
     config_location: String,
-    config: RwLock<Config>,
+    config: RwLock<Option<Config>>,
 }
 
 impl Application {
     pub async fn new(config_location: String) -> Result<Self> {
         let me = Self {
             config_location,
-            config: RwLock::new(Config::default()),
+            config: RwLock::new(None),
         };
 
-        me.reload_config(false).await?;
+        if !me.config_location.is_empty() {
+            me.reload_config().await?;
+        }
 
+        Ok(me)
+    }
+
+    #[allow(dead_code)]
+    pub async fn from_config(config: Config) -> Result<Self> {
+        let me = Self::new("".to_string()).await?;
+        me.try_load_config(config).await?;
         Ok(me)
     }
 
@@ -71,7 +41,7 @@ impl Application {
 
         loop {
             s.recv().await;
-            match me.reload_config(true).await {
+            match me.reload_config().await {
                 Ok(_) => eprintln!("Successfully reloaded configuration"),
                 Err(e) => eprintln!("Got an error during configuration reload: {}", e),
             };
@@ -90,52 +60,53 @@ impl Application {
         Ok(())
     }
 
-    pub async fn reload_config(&self, check: bool) -> Result<()> {
+    pub async fn reload_config(&self) -> Result<()> {
         let mut content = String::new();
         File::open(self.config_location.as_str())?.read_to_string(&mut content)?;
 
         let new_config: Config = toml::from_str(content.as_str())?;
+
+        self.try_load_config(new_config).await
+    }
+
+    pub async fn try_load_config(&self, mut new_config: Config) -> Result<()> {
         new_config.check()?;
 
-        {
-            let mut old_config = self.config.write().await;
+        let mut old_config = self.config.write().await;
 
-            if check && new_config.changes_require_restart(&*old_config) {
+        if let Some(ref old_config_struct) = *old_config {
+            if new_config.requires_restart(old_config_struct) {
                 return Err(anyhow!(
                     "These configuration changes would require a restart."
                 ));
             }
-
-            *old_config = new_config;
         }
+
+        *old_config = Some(new_config);
 
         Ok(())
     }
 
     pub async fn setup_server(me: Arc<Self>) -> Result<()> {
         let mut server = tide::Server::new();
-        server
-            .at("/")
-            .get(|_| async { Ok(Redirect::permanent("/_")) });
-        server
-            .at("/_")
-            .get(|_| async { Ok(Redirect::permanent("/_/_")) });
 
         let me_clone: Arc<Application> = me.clone();
-        server.at("/_/*path").get(move |r: Request<()>| {
+        let handler = move |r: Request<()>| {
             let me_clone = me_clone.clone();
-            async move { me_clone.handle_special_request(&r).await }
-        });
+            async move { me_clone.handle_request(&r).await }
+        };
 
-        let me_clone: Arc<Application> = me.clone();
-        server.at("/:short").get(move |r: Request<()>| {
-            let me_clone = me_clone.clone();
-            async move { me_clone.handle_normal_request(&r).await }
-        });
+        server.at("/").get(handler.clone());
+        server.at("/*path").get(handler.clone());
 
         let listener = {
-            let config = me.config.read().await;
-            format!("{}:{}", config.host, config.port)
+            if let Some(ref some_config) = *me.config.read().await {
+                some_config.host.spec_string()
+            } else {
+                return Err(anyhow!(
+                    "server was not configured before attempting to run."
+                ));
+            }
         };
 
         server.listen(listener).await?;
@@ -143,18 +114,78 @@ impl Application {
         Ok(())
     }
 
-    pub async fn handle_normal_request(&self, req: &Request<()>) -> tide::Result {
+    pub async fn handle_request(&self, req: &Request<()>) -> tide::Result {
         let config = self.config.read().await;
-        return match config.links.get(req.param("short")?) {
-            Some(link) => Ok(Redirect::temporary(link.dst.as_str()).into()),
-            None => Err(tide::Error::new(
-                404,
-                anyhow!("The requested shortlink does not exist."),
-            )),
-        };
+        if let Some(ref config_struct) = *config {
+            if let Ok(path) = req.param("path") {
+                let real_path = path.trim_end_matches('/');
+                if let Some(page) = config_struct.pages.get(real_path) {
+                    page.serve()
+                } else {
+                    config_struct.errors.not_found.serve()
+                }
+            } else {
+                config_struct.errors.no_path.serve()
+            }
+        } else {
+            Err(anyhow!("The server attempted to serve a page before it was configured.").into())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use crate::config::Config;
+
+    use super::Application;
+
+    async fn working_dummy_task() -> (
+        Arc<Application>,
+        tokio::task::JoinHandle<anyhow::Result<()>>,
+    ) {
+        let app = Application::from_config(Config::working_dummy_config())
+            .await
+            .unwrap();
+        let arc = Arc::new(app);
+        let task = tokio::task::spawn(Application::setup_server(arc.clone()));
+        (arc.clone(), task)
     }
 
-    pub async fn handle_special_request(&self, _req: &Request<()>) -> tide::Result {
-        Err(tide::Error::new(404, anyhow!("Not found.")))
+    async fn wait_until_loaded(url: String) {
+        for wait in 1..100 {
+            if let Ok(_) = reqwest::get(url.clone()).await {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
+        }
+
+        panic!("server never finished starting!");
+    }
+
+    #[tokio::test]
+    async fn main_test() {
+        let _ = working_dummy_task().await;
+        let url_base = format!("http://{}", Config::working_dummy_hostspec().spec_string());
+        wait_until_loaded(format!("{}/abc", url_base)).await;
+        assert_eq!(
+            reqwest::get(url_base.clone() + "/abc")
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap(),
+            "abc"
+        );
+        assert_eq!(
+            reqwest::get(url_base.clone() + "/redir")
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap(),
+            "abc"
+        );
     }
 }
