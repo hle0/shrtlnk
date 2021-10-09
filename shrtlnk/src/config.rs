@@ -201,4 +201,37 @@ impl Config {
     pub fn requires_restart<T: Borrow<Self>>(&self, other: T) -> bool {
         self.host != other.borrow().host
     }
+
+    #[cfg(test)]
+    pub fn working_dummy_hostspec() -> HostSpec {
+        HostSpec {
+            host: "localhost".to_string(),
+            port: 43982, // a random port unlikely to be taken
+        }
+    }
+
+    #[cfg(test)]
+    pub fn working_dummy_config() -> Self {
+        Self {
+            host: Self::working_dummy_hostspec(),
+            pages: {
+                let mut map = BTreeMap::new();
+                map.insert(
+                    "abc".to_string(),
+                    StaticPage::Embedded {
+                        data: "abc".to_string(),
+                        content_type: "text/plain".to_string(),
+                    },
+                );
+                map.insert(
+                    "redir".to_string(),
+                    StaticPage::Redirect {
+                        to: "/abc".to_string(),
+                    },
+                );
+                map
+            },
+            errors: ErrorPages::default(),
+        }
+    }
 }

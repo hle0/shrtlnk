@@ -18,8 +18,17 @@ impl Application {
             config: RwLock::new(None),
         };
 
-        me.reload_config().await?;
+        if !me.config_location.is_empty() {
+            me.reload_config().await?;
+        }
 
+        Ok(me)
+    }
+
+    #[allow(dead_code)]
+    pub async fn from_config(config: Config) -> Result<Self> {
+        let me = Self::new("".to_string()).await?;
+        me.try_load_config(config).await?;
         Ok(me)
     }
 
@@ -55,22 +64,25 @@ impl Application {
         let mut content = String::new();
         File::open(self.config_location.as_str())?.read_to_string(&mut content)?;
 
-        let mut new_config: Config = toml::from_str(content.as_str())?;
+        let new_config: Config = toml::from_str(content.as_str())?;
+
+        self.try_load_config(new_config).await
+    }
+
+    pub async fn try_load_config(&self, mut new_config: Config) -> Result<()> {
         new_config.check()?;
 
-        {
-            let mut old_config = self.config.write().await;
+        let mut old_config = self.config.write().await;
 
-            if let Some(ref old_config_struct) = *old_config {
-                if new_config.requires_restart(old_config_struct) {
-                    return Err(anyhow!(
-                        "These configuration changes would require a restart."
-                    ));
-                }
+        if let Some(ref old_config_struct) = *old_config {
+            if new_config.requires_restart(old_config_struct) {
+                return Err(anyhow!(
+                    "These configuration changes would require a restart."
+                ));
             }
-
-            *old_config = Some(new_config);
         }
+
+        *old_config = Some(new_config);
 
         Ok(())
     }
@@ -118,5 +130,62 @@ impl Application {
         } else {
             Err(anyhow!("The server attempted to serve a page before it was configured.").into())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use crate::config::Config;
+
+    use super::Application;
+
+    async fn working_dummy_task() -> (
+        Arc<Application>,
+        tokio::task::JoinHandle<anyhow::Result<()>>,
+    ) {
+        let app = Application::from_config(Config::working_dummy_config())
+            .await
+            .unwrap();
+        let arc = Arc::new(app);
+        let task = tokio::task::spawn(Application::setup_server(arc.clone()));
+        (arc.clone(), task)
+    }
+
+    async fn wait_until_loaded(url: String) {
+        for wait in 1..100 {
+            if let Ok(_) = reqwest::get(url.clone()).await {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
+        }
+
+        panic!("server never finished starting!");
+    }
+
+    #[tokio::test]
+    async fn main_test() {
+        let _ = working_dummy_task().await;
+        let url_base = format!("http://{}", Config::working_dummy_hostspec().spec_string());
+        wait_until_loaded(format!("{}/abc", url_base)).await;
+        assert_eq!(
+            reqwest::get(url_base.clone() + "/abc")
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap(),
+            "abc"
+        );
+        assert_eq!(
+            reqwest::get(url_base.clone() + "/redir")
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap(),
+            "abc"
+        );
     }
 }
