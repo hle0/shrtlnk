@@ -14,7 +14,8 @@ pub enum StaticPage {
     Redirect { to: String },
     #[serde(rename = "string")]
     Embedded {
-        data: String,
+        #[serde(with = "serde_bytes")]
+        data: Vec<u8>,
         #[serde(default = "StaticPage::default_content_type")]
         content_type: String,
     },
@@ -24,7 +25,7 @@ pub enum StaticPage {
         #[serde(default = "StaticPage::default_content_type")]
         content_type: String,
         #[serde(skip)]
-        cached_data: String,
+        cached_data: Vec<u8>,
     },
 }
 
@@ -58,7 +59,7 @@ impl CheckConfig for StaticPage {
             path, cached_data, ..
         } = self
         {
-            File::open(path)?.read_to_string(cached_data)?;
+            File::open(path)?.read_to_end(cached_data)?;
         };
         Ok(())
     }
@@ -136,7 +137,7 @@ impl ErrorPages {
 
     fn default_page_not_found() -> StaticPage {
         StaticPage::Embedded {
-            data: "404: not found.".to_string(),
+            data: "404: not found.".as_bytes().to_vec(),
             content_type: "text/html".to_string(),
         }
     }
@@ -219,7 +220,7 @@ impl Config {
                 map.insert(
                     "abc".to_string(),
                     StaticPage::Embedded {
-                        data: "abc".to_string(),
+                        data: "abc".as_bytes().to_vec(),
                         content_type: "text/plain".to_string(),
                     },
                 );
