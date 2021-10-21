@@ -1,10 +1,108 @@
-use std::{borrow::Borrow, collections::BTreeMap, fs::File, io::Read};
+use std::{borrow::Borrow, fs::File, io::Read, net::SocketAddr};
 
-use anyhow::anyhow;
+use anyhow::{anyhow, Context};
+use hyper::{
+    body::{Body, Bytes},
+    Request, Response, Uri,
+};
 use serde::Deserialize;
 
 pub trait CheckConfig {
     fn check(&mut self) -> anyhow::Result<()>;
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "matches")]
+pub enum Matcher {
+    #[serde(rename = "path")]
+    Path { path: String },
+    #[serde(rename = "regex")]
+    Regex {
+        expr: String,
+        #[serde(skip)]
+        compiled: Option<regex::Regex>,
+    },
+    #[serde(rename = "any")]
+    Any { of: Vec<Matcher> },
+    #[serde(rename = "all")]
+    All { of: Vec<Matcher> },
+    #[serde(rename = "not")]
+    Not { matcher: Box<Matcher> },
+}
+
+impl Matcher {
+    pub fn matches(&self, req: &Request<Body>) -> bool {
+        match self {
+            Self::Path { path } => {
+                let req_path = req.uri().path();
+
+                req_path.trim_start_matches('/').trim_end_matches('/')
+                    == path.as_str().trim_start_matches('/').trim_end_matches('/')
+            }
+            Self::Regex { compiled, .. } => compiled.as_ref().unwrap().is_match(req.uri().path()),
+            Self::Any { of } => {
+                for matcher in of {
+                    if matcher.matches(req) {
+                        return true;
+                    }
+                }
+
+                false
+            }
+            Self::All { of } => {
+                for matcher in of {
+                    if !matcher.matches(req) {
+                        return false;
+                    }
+                }
+
+                true
+            }
+            Self::Not { matcher } => !matcher.matches(req),
+        }
+    }
+}
+
+impl CheckConfig for Matcher {
+    fn check(&mut self) -> anyhow::Result<()> {
+        match self {
+            Self::Path { .. } => Ok(()),
+            Self::Regex { expr, compiled } => {
+                *compiled = Some(regex::Regex::new(expr.as_str())?);
+
+                Ok(())
+            }
+            Self::All { of } => {
+                if of.is_empty() {
+                    return Err(anyhow!("no submatchers. there should be at least one.")
+                        .context("inside a MatchesAll matcher block"));
+                }
+
+                for matcher in of {
+                    if let Err(e) = matcher.check() {
+                        return Err(e.context("inside a MatchesAll matcher block"));
+                    }
+                }
+
+                Ok(())
+            }
+            Self::Any { of } => {
+                if of.is_empty() {
+                    return Err(anyhow!("no submatchers. there should be at least one.")
+                        .context("inside a MatchesAny matcher block"));
+                }
+
+                for matcher in of {
+                    if let Err(e) = matcher.check() {
+                        return Err(e.context("inside a MatchesAny matcher block"));
+                    }
+                }
+
+                Ok(())
+            }
+            Self::Not { matcher } => matcher.check(),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -27,28 +125,65 @@ pub enum StaticPage {
         #[serde(skip)]
         cached_data: Vec<u8>,
     },
+    #[serde(rename = "proxy")]
+    ReverseProxy {
+        #[serde(default = "StaticPage::default_scheme")]
+        scheme: String,
+        host: String,
+        #[serde(skip)]
+        client: hyper::Client<hyper::client::HttpConnector>,
+    },
 }
 
 impl StaticPage {
+    fn default_scheme() -> String {
+        "http".to_string()
+    }
+
     fn default_content_type() -> String {
         "text/html".to_string()
     }
 
-    pub fn serve(&self) -> tide::Result {
+    pub async fn serve(&self, req: Request<Body>) -> anyhow::Result<Response<Body>> {
         match &self {
-            Self::Redirect { to } => Ok(tide::Redirect::temporary(to).into()),
-            Self::Embedded { data, content_type } => Ok(tide::Response::builder(200)
-                .header("content-type", content_type)
-                .body(data.clone())
-                .build()),
+            Self::Redirect { to } => Ok(Response::builder()
+                .status(307)
+                .header("Location", to)
+                .body(Body::empty())?),
+            Self::Embedded { data, content_type } => Ok(Response::builder()
+                .status(200)
+                .header("Content-Type", content_type)
+                .body(Bytes::copy_from_slice(data.as_slice()).into())?),
             Self::StaticFile {
                 content_type,
                 cached_data,
                 ..
-            } => Ok(tide::Response::builder(200)
-                .header("content-type", content_type)
-                .body(cached_data.clone())
-                .build()),
+            } => Ok(Response::builder()
+                .status(200)
+                .header("Content-Type", content_type)
+                .body(Bytes::copy_from_slice(cached_data.as_slice()).into())?),
+            Self::ReverseProxy {
+                scheme,
+                host,
+                client,
+            } => {
+                let mut parts = req.uri().clone().into_parts();
+                parts.scheme = Some(scheme.parse()?);
+                parts.authority = Some(host.parse()?);
+
+                let uri = Uri::from_parts(parts)?;
+                /* fold the old headers into the new request */
+                let new_req = req
+                    .headers()
+                    .into_iter()
+                    .fold(
+                        Request::builder().method(req.method()).uri(uri),
+                        |builder, (name, value)| builder.header(name, value),
+                    )
+                    .body(req.into_body())?;
+
+                Ok(client.request(new_req).await?)
+            }
         }
     }
 }
@@ -59,8 +194,26 @@ impl CheckConfig for StaticPage {
             path, cached_data, ..
         } = self
         {
-            File::open(path)?.read_to_end(cached_data)?;
+            if let Err(e) = File::open(path).and_then(|mut x| x.read_to_end(cached_data)) {
+                return Err(anyhow!(e).context("inside a StaticFile page"));
+            }
         };
+        Ok(())
+    }
+}
+
+#[derive(Deserialize)]
+pub struct Handler {
+    #[serde(rename = "must_match")]
+    pub matcher: Matcher,
+    #[serde(flatten)]
+    pub page: StaticPage,
+}
+
+impl CheckConfig for Handler {
+    fn check(&mut self) -> anyhow::Result<()> {
+        self.matcher.check().context("inside the root matcher")?;
+        self.page.check().context("inside the page")?;
         Ok(())
     }
 }
@@ -90,15 +243,15 @@ impl Default for HostSpec {
 
 impl HostSpec {
     fn default_host() -> String {
-        "localhost".to_string()
+        "127.0.0.1".to_string()
     }
 
     fn default_port() -> u16 {
         8387
     }
 
-    pub fn spec_string(&self) -> String {
-        format!("{}:{}", self.host, self.port)
+    pub fn spec(&self) -> SocketAddr {
+        SocketAddr::new(self.host.parse().unwrap(), self.port)
     }
 }
 
@@ -112,8 +265,12 @@ pub struct ErrorPages {
 
 impl CheckConfig for ErrorPages {
     fn check(&mut self) -> anyhow::Result<()> {
-        self.not_found.check()?;
-        self.no_path.check()?;
+        self.not_found
+            .check()
+            .context("inside the not_found ErrorPage")?;
+        self.no_path
+            .check()
+            .context("inside the no_path ErrorPage")?;
 
         Ok(())
     }
@@ -147,51 +304,19 @@ impl ErrorPages {
 pub struct Config {
     #[serde(flatten, default)]
     pub host: HostSpec,
-    pub pages: BTreeMap<String, StaticPage>,
+    pub handlers: Vec<Handler>,
     #[serde(default)]
     pub errors: ErrorPages,
 }
 
 impl CheckConfig for Config {
     fn check(&mut self) -> anyhow::Result<()> {
-        self.host.check()?;
-        self.errors.check()?;
-        for (key, value) in self.pages.iter_mut() {
-            if key.is_empty() {
-                return Err(anyhow!(
-                    "one of the pages has an empty prefix. this means it won't be accessible. \
-                     you probably want to change the index page via errors.no_path instead."
-                ));
-            }
-
-            if key.starts_with('/') {
-                return Err(anyhow!(
-                    "the page key '{:?}' starts with a slash ('/'). this means it won't be routed properly. \
-                     if you're trying to map an absolute prefix, just remove the leading slash.",
-                    key
-                ));
-            }
-
-            if key.ends_with('/') {
-                return Err(anyhow!(
-                    "the page key '{:?}' ends with a slash ('/'). this is invalid. \
-                     but, any trailing slashes in a path are automatically discarded during routing. \
-                     you should just remove the trailing slashes from the key.",
-                    key
-                ));
-            }
-
-            if key.contains("//") {
-                return Err(anyhow!(
-                    "the page key '{:?}' contains at least two consecutive slashes ('//'). \
-                     this means the key will not be routed properly. \
-                     you should make sure all keys don't start or end with slashes, \
-                     and never have more than one consecutive slash.",
-                    key
-                ));
-            }
-
-            value.check()?;
+        self.host.check().context("inside the HostSpec")?;
+        self.errors.check().context("inside the error handlers")?;
+        for (i, handler) in self.handlers.iter_mut().enumerate() {
+            handler
+                .check()
+                .context(format!("inside handler {} (counting from 0)", i))?;
         }
 
         Ok(())
@@ -206,7 +331,7 @@ impl Config {
     #[cfg(test)]
     pub fn working_dummy_hostspec() -> HostSpec {
         HostSpec {
-            host: "localhost".to_string(),
+            host: "127.0.0.1".to_string(),
             port: 43982, // a random port unlikely to be taken
         }
     }
@@ -215,23 +340,25 @@ impl Config {
     pub fn working_dummy_config() -> Self {
         Self {
             host: Self::working_dummy_hostspec(),
-            pages: {
-                let mut map = BTreeMap::new();
-                map.insert(
-                    "abc".to_string(),
-                    StaticPage::Embedded {
+            handlers: vec![
+                Handler {
+                    matcher: Matcher::Path {
+                        path: "abc".to_string(),
+                    },
+                    page: StaticPage::Embedded {
                         data: "abc".as_bytes().to_vec(),
                         content_type: "text/plain".to_string(),
                     },
-                );
-                map.insert(
-                    "redir".to_string(),
-                    StaticPage::Redirect {
+                },
+                Handler {
+                    matcher: Matcher::Path {
+                        path: "redir".to_string(),
+                    },
+                    page: StaticPage::Redirect {
                         to: "/abc".to_string(),
                     },
-                );
-                map
-            },
+                },
+            ],
             errors: ErrorPages::default(),
         }
     }

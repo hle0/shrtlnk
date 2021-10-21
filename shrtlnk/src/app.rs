@@ -1,10 +1,14 @@
-use std::{fs::File, io::Read, sync::Arc};
-
-use anyhow::{anyhow, Result};
-use tide::Request;
-use tokio::sync::RwLock;
+use std::{convert::Infallible, fs::File, io::Read, sync::Arc};
 
 use crate::config::{CheckConfig, Config};
+use anyhow::{anyhow, Result};
+use hyper::{
+    body::Body,
+    server::conn::AddrStream,
+    service::{make_service_fn, service_fn},
+    Request, Response, Server,
+};
+use tokio::sync::RwLock;
 
 pub struct Application {
     config_location: String,
@@ -88,20 +92,19 @@ impl Application {
     }
 
     pub async fn setup_server(me: Arc<Self>) -> Result<()> {
-        let mut server = tide::Server::new();
-
-        let me_clone: Arc<Application> = me.clone();
-        let handler = move |r: Request<()>| {
-            let me_clone = me_clone.clone();
-            async move { me_clone.handle_request(&r).await }
-        };
-
-        server.at("/").get(handler.clone());
-        server.at("/*path").get(handler.clone());
+        let the_service = make_service_fn(|_: &AddrStream| {
+            let me_clone = me.clone();
+            async move {
+                Ok::<_, Infallible>(service_fn(move |r| {
+                    let me_clone = me_clone.clone();
+                    async move { me_clone.handle_request(r).await }
+                }))
+            }
+        });
 
         let listener = {
             if let Some(ref some_config) = *me.config.read().await {
-                some_config.host.spec_string()
+                some_config.host.spec()
             } else {
                 return Err(anyhow!(
                     "server was not configured before attempting to run."
@@ -109,26 +112,30 @@ impl Application {
             }
         };
 
-        server.listen(listener).await?;
+        if let Err(e) = Server::bind(&listener).serve(the_service).await {
+            return Err(anyhow!(e));
+        }
 
         Ok(())
     }
 
-    pub async fn handle_request(&self, req: &Request<()>) -> tide::Result {
+    pub async fn handle_request(&self, req: Request<Body>) -> anyhow::Result<Response<Body>> {
         let config = self.config.read().await;
         if let Some(ref config_struct) = *config {
-            if let Ok(path) = req.param("path") {
-                let real_path = path.trim_end_matches('/');
-                if let Some(page) = config_struct.pages.get(real_path) {
-                    page.serve()
-                } else {
-                    config_struct.errors.not_found.serve()
-                }
+            let real_path = req.uri().path();
+            if real_path.trim_start_matches('/').is_empty() {
+                return config_struct.errors.no_path.serve(req).await;
             } else {
-                config_struct.errors.no_path.serve()
+                for handler in config_struct.handlers.iter() {
+                    if handler.matcher.matches(&req) {
+                        return handler.page.serve(req).await;
+                    }
+                }
             }
+
+            config_struct.errors.not_found.serve(req).await
         } else {
-            Err(anyhow!("The server attempted to serve a page before it was configured.").into())
+            panic!("The server attempted to serve a page before it was configured.");
         }
     }
 }
@@ -167,7 +174,7 @@ mod tests {
     #[tokio::test]
     async fn main_test() {
         let _ = working_dummy_task().await;
-        let url_base = format!("http://{}", Config::working_dummy_hostspec().spec_string());
+        let url_base = format!("http://{}", Config::working_dummy_hostspec().spec());
         wait_until_loaded(format!("{}/abc", url_base)).await;
         assert_eq!(
             reqwest::get(url_base.clone() + "/abc")
