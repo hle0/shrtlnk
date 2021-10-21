@@ -3,7 +3,7 @@ use std::{convert::Infallible, fs::File, io::Read, sync::Arc};
 use crate::config::{CheckConfig, Config};
 use anyhow::{anyhow, Result};
 use hyper::{
-    body::Body,
+    body::{Body, Bytes},
     server::conn::AddrStream,
     service::{make_service_fn, service_fn},
     Request, Response, Server,
@@ -129,7 +129,9 @@ impl Application {
             {
                 handler.page.serve(req).await
             } else {
-                config_struct.errors.not_found.serve(req).await
+                Ok(Response::builder()
+                    .status(404)
+                    .body(Body::from(Bytes::from_static(b"404: not found")))?)
             }
         } else {
             panic!("The server attempted to serve a page before it was configured.");

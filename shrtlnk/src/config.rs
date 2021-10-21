@@ -30,6 +30,8 @@ pub enum Matcher {
     Not { matcher: Box<Matcher> },
     #[serde(rename = "root")]
     Root,
+    #[serde(rename = "always")]
+    Always,
 }
 
 impl Matcher {
@@ -62,6 +64,7 @@ impl Matcher {
             }
             Self::Not { matcher } => !matcher.matches(req),
             Self::Root => req.uri().path().chars().all(|c| c == '/'),
+            Self::Always => true,
         }
     }
 }
@@ -105,6 +108,7 @@ impl CheckConfig for Matcher {
             }
             Self::Not { matcher } => matcher.check(),
             Self::Root => Ok(()),
+            Self::Always => Ok(()),
         }
     }
 }
@@ -260,51 +264,15 @@ impl HostSpec {
 }
 
 #[derive(Deserialize)]
-pub struct ErrorPages {
-    #[serde(default = "ErrorPages::default_page_not_found")]
-    pub not_found: StaticPage,
-}
-
-impl CheckConfig for ErrorPages {
-    fn check(&mut self) -> anyhow::Result<()> {
-        self.not_found
-            .check()
-            .context("inside the not_found ErrorPage")?;
-
-        Ok(())
-    }
-}
-
-impl Default for ErrorPages {
-    fn default() -> Self {
-        Self {
-            not_found: Self::default_page_not_found(),
-        }
-    }
-}
-
-impl ErrorPages {
-    fn default_page_not_found() -> StaticPage {
-        StaticPage::Embedded {
-            data: "404: not found.".as_bytes().to_vec(),
-            content_type: "text/html".to_string(),
-        }
-    }
-}
-
-#[derive(Deserialize)]
 pub struct Config {
     #[serde(flatten, default)]
     pub host: HostSpec,
     pub handlers: Vec<Handler>,
-    #[serde(default)]
-    pub errors: ErrorPages,
 }
 
 impl CheckConfig for Config {
     fn check(&mut self) -> anyhow::Result<()> {
         self.host.check().context("inside the HostSpec")?;
-        self.errors.check().context("inside the error handlers")?;
         for (i, handler) in self.handlers.iter_mut().enumerate() {
             handler
                 .check()
@@ -351,7 +319,6 @@ impl Config {
                     },
                 },
             ],
-            errors: ErrorPages::default(),
         }
     }
 }
