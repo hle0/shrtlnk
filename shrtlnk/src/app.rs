@@ -122,18 +122,15 @@ impl Application {
     pub async fn handle_request(&self, req: Request<Body>) -> anyhow::Result<Response<Body>> {
         let config = self.config.read().await;
         if let Some(ref config_struct) = *config {
-            let real_path = req.uri().path();
-            if real_path.trim_start_matches('/').is_empty() {
-                return config_struct.errors.no_path.serve(req).await;
+            if let Some(handler) = config_struct
+                .handlers
+                .iter()
+                .find(|m| m.matcher.matches(&req))
+            {
+                handler.page.serve(req).await
             } else {
-                for handler in config_struct.handlers.iter() {
-                    if handler.matcher.matches(&req) {
-                        return handler.page.serve(req).await;
-                    }
-                }
+                config_struct.errors.not_found.serve(req).await
             }
-
-            config_struct.errors.not_found.serve(req).await
         } else {
             panic!("The server attempted to serve a page before it was configured.");
         }

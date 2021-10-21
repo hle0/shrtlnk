@@ -28,6 +28,8 @@ pub enum Matcher {
     All { of: Vec<Matcher> },
     #[serde(rename = "not")]
     Not { matcher: Box<Matcher> },
+    #[serde(rename = "root")]
+    Root,
 }
 
 impl Matcher {
@@ -59,6 +61,7 @@ impl Matcher {
                 true
             }
             Self::Not { matcher } => !matcher.matches(req),
+            Self::Root => req.uri().path().chars().all(|c| c == '/'),
         }
     }
 }
@@ -101,6 +104,7 @@ impl CheckConfig for Matcher {
                 Ok(())
             }
             Self::Not { matcher } => matcher.check(),
+            Self::Root => Ok(()),
         }
     }
 }
@@ -259,8 +263,6 @@ impl HostSpec {
 pub struct ErrorPages {
     #[serde(default = "ErrorPages::default_page_not_found")]
     pub not_found: StaticPage,
-    #[serde(default = "ErrorPages::default_page_no_path")]
-    pub no_path: StaticPage,
 }
 
 impl CheckConfig for ErrorPages {
@@ -268,9 +270,6 @@ impl CheckConfig for ErrorPages {
         self.not_found
             .check()
             .context("inside the not_found ErrorPage")?;
-        self.no_path
-            .check()
-            .context("inside the no_path ErrorPage")?;
 
         Ok(())
     }
@@ -280,18 +279,11 @@ impl Default for ErrorPages {
     fn default() -> Self {
         Self {
             not_found: Self::default_page_not_found(),
-            no_path: Self::default_page_no_path(),
         }
     }
 }
 
 impl ErrorPages {
-    fn default_page_no_path() -> StaticPage {
-        StaticPage::Redirect {
-            to: "/_".to_string(),
-        }
-    }
-
     fn default_page_not_found() -> StaticPage {
         StaticPage::Embedded {
             data: "404: not found.".as_bytes().to_vec(),
